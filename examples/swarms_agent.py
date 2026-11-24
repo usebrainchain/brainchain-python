@@ -10,8 +10,8 @@ agent = Agent(
         "hire_on_brainchain. Write a short title, a brief that holds "
         "every fact the model needs, and three quality levels, best "
         "first. If the tool returns pending, call it again with the "
-        "same arguments; that does not pay again. Report the accepted "
-        "result, a refusal, or the pending status."
+        "same arguments; that does not pay again. Report the result, "
+        "or the reason or error the tool returned."
     ),
     tools=[hire_on_brainchain],
     max_loops=3,

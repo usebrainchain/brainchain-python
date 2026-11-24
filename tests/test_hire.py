@@ -29,6 +29,9 @@ ACCEPTED = {
     "task": {"status": "graded", "accepted": True},
     "result": RESULT_URL,
 }
+NO_ORDER = (404, {"error": "No order with that id."})
+HOST_404 = (404, None, "Not Found")
+
 REJECTED = {
     "state": "posted",
     "task": {"status": "graded", "accepted": False},
@@ -78,12 +81,12 @@ def payment_required(*offers):
 
 
 @pytest.fixture
-def desk(monkeypatch):
+def api(monkeypatch):
     state = SimpleNamespace(
         challenge=payment_required(offer(BASE, name="USD Coin", version="2")),
         paid=FakeResponse(202, {"order": ORDER}),
         views=[RUNNING],
-        status=200,
+        missing=None,
         payments=0,
         gate=None,
         bodies=[],
@@ -108,8 +111,10 @@ def desk(monkeypatch):
         assert allow_redirects is False
         if url == RESULT_URL:
             return state.result
+        if state.missing:
+            return state.missing
         view = state.views.pop(0) if len(state.views) > 1 else state.views[0]
-        return FakeResponse(state.status, view)
+        return FakeResponse(200, view)
 
     monkeypatch.setenv("BRAINCHAIN_PAYER_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("BRAINCHAIN_PAY_ON", "base")
@@ -171,8 +176,8 @@ def hire(brief=BRIEF):
             },
             {
                 "accepted": False,
-                "reason": "No model was hired in time. The full payment "
-                "went back to the paying wallet.",
+                "reason": "No model was hired in time. The payment was "
+                "refunded to the paying wallet.",
             },
         ),
         (
@@ -195,14 +200,14 @@ def hire(brief=BRIEF):
         ({"state": "failed"}, {"accepted": False, "charged": False}),
     ],
 )
-def test_hire_returns_the_outcome_of_the_order(desk, view, expected):
-    desk.views = [view]
+def test_hire_returns_the_outcome_of_the_order(api, view, expected):
+    api.views = [view]
 
     reply = hire()
 
     assert {key: reply.get(key) for key in expected} == expected
     assert reply["status_url"] == f"{URL}/x402/tasks/{ORDER}"
-    assert desk.payments == 1
+    assert api.payments == 1
 
 
 @pytest.mark.parametrize(
@@ -229,16 +234,16 @@ def test_hire_returns_the_outcome_of_the_order(desk, view, expected):
         ),
     ],
 )
-def test_an_identical_call_never_pays_again(desk, views, paid, first):
-    desk.views = views
-    desk.paid = paid or desk.paid
+def test_an_identical_call_never_pays_again(api, views, paid, first):
+    api.views = views
+    api.paid = paid or api.paid
 
     reply = hire()
     again = hire()
 
     assert {key: reply.get(key) for key in first} == first
     assert again.get("accepted") is (views[-1] is ACCEPTED)
-    assert desk.payments == 1
+    assert api.payments == 1
 
 
 def run_together(*briefs):
@@ -256,9 +261,9 @@ def run_together(*briefs):
     return replies
 
 
-def test_identical_calls_at_once_pay_once(desk):
-    desk.views = [ACCEPTED]
-    desk.gate = SimpleNamespace(wait=lambda: time.sleep(0.1))
+def test_identical_calls_at_once_pay_once(api):
+    api.views = [ACCEPTED]
+    api.gate = SimpleNamespace(wait=lambda: time.sleep(0.1))
 
     replies = run_together(BRIEF, BRIEF)
 
@@ -266,12 +271,12 @@ def test_identical_calls_at_once_pay_once(desk):
         True,
         True,
     ]
-    assert desk.payments == 1
+    assert api.payments == 1
 
 
-def test_different_tasks_post_at_the_same_time(desk):
-    desk.views = [ACCEPTED]
-    desk.gate = threading.Barrier(2, timeout=5)
+def test_different_tasks_post_at_the_same_time(api):
+    api.views = [ACCEPTED]
+    api.gate = threading.Barrier(2, timeout=5)
 
     replies = run_together(BRIEF, "List the primes below 20.")
 
@@ -279,10 +284,10 @@ def test_different_tasks_post_at_the_same_time(desk):
         True,
         True,
     ]
-    assert desk.payments == 2
+    assert api.payments == 2
 
 
-def test_a_stale_failure_cannot_remove_a_new_paid_order(desk, monkeypatch):
+def test_a_stale_failure_cannot_remove_a_new_paid_order(api, monkeypatch):
     waiting = threading.Event()
     release = threading.Event()
     wait_for_outcome = brainchain._wait_for_outcome
@@ -299,9 +304,9 @@ def test_a_stale_failure_cannot_remove_a_new_paid_order(desk, monkeypatch):
     stale.start()
     try:
         assert waiting.wait(5)
-        desk.views = [{"state": "failed"}]
+        api.views = [{"state": "failed"}]
         assert hire()["charged"] is False
-        desk.views = [ACCEPTED]
+        api.views = [ACCEPTED]
         assert hire()["accepted"] is True
     finally:
         release.set()
@@ -309,39 +314,48 @@ def test_a_stale_failure_cannot_remove_a_new_paid_order(desk, monkeypatch):
 
     assert not stale.is_alive()
     assert hire()["accepted"] is True
-    assert desk.payments == 2
+    assert api.payments == 2
 
 
 @pytest.mark.parametrize(
     "setup, error",
     [
         (
-            lambda desk, env: env.delenv("BRAINCHAIN_PAYER_KEY"),
-            "Set BRAINCHAIN_PAYER_KEY to the paying wallet's 32-byte hex private key.",
+            lambda api, env: env.delenv("BRAINCHAIN_PAYER_KEY"),
+            "Set BRAINCHAIN_PAYER_KEY to the paying wallet's private key.",
         ),
         (
-            lambda desk, env: env.setenv("BRAINCHAIN_PAY_ON", "solana"),
+            lambda api, env: env.setenv("BRAINCHAIN_PAYER_KEY", "0xabc"),
+            "BRAINCHAIN_PAYER_KEY must be a 32-byte hex private key, "
+            "with or without 0x.",
+        ),
+        (
+            lambda api, env: env.setenv("BRAINCHAIN_WAIT_SECONDS", "-5"),
+            "BRAINCHAIN_WAIT_SECONDS must be a whole number of seconds, 0 or more.",
+        ),
+        (
+            lambda api, env: env.setenv("BRAINCHAIN_PAY_ON", "solana"),
             "BRAINCHAIN_PAY_ON must be base or robinhood.",
         ),
         (
-            lambda desk, env: setattr(
-                desk,
+            lambda api, env: setattr(
+                api,
                 "challenge",
                 brainchain.requests.ConnectionError("down"),
             ),
-            "Could not reach BrainChain (ConnectionError), so nothing was paid.",
+            "Could not reach BrainChain (ConnectionError), so nothing was charged.",
         ),
         (
-            lambda desk, env: setattr(
-                desk,
+            lambda api, env: setattr(
+                api,
                 "challenge",
                 FakeResponse(400, {"error": "levels must have 2 or 3"}),
             ),
             "BrainChain answered 400: levels must have 2 or 3",
         ),
         (
-            lambda desk, env: setattr(
-                desk,
+            lambda api, env: setattr(
+                api,
                 "challenge",
                 payment_required(offer(BASE, "1000001")),
             ),
@@ -349,16 +363,16 @@ def test_a_stale_failure_cannot_remove_a_new_paid_order(desk, monkeypatch):
             "above BRAINCHAIN_MAX_PRICE_UNITS (1000000).",
         ),
         (
-            lambda desk, env: setattr(
-                desk,
+            lambda api, env: setattr(
+                api,
                 "paid",
                 FakeResponse(402, {"error": "invalid_signature"}),
             ),
             "BrainChain answered 402: invalid_signature",
         ),
         (
-            lambda desk, env: setattr(
-                desk,
+            lambda api, env: setattr(
+                api,
                 "paid",
                 FakeResponse(402, {"error": "insufficient_funds"}),
             ),
@@ -368,39 +382,68 @@ def test_a_stale_failure_cannot_remove_a_new_paid_order(desk, monkeypatch):
     ],
 )
 def test_refused_tasks_say_why_and_that_nothing_was_charged(
-    desk, monkeypatch, setup, error
+    api, monkeypatch, setup, error
 ):
-    setup(desk, monkeypatch)
+    setup(api, monkeypatch)
 
     assert hire() == {"error": error, "charged": False}
 
 
-def test_non_json_arguments_are_refused_before_payment(desk):
-    reply = hire(object())
-
-    assert "not JSON serializable" in reply["error"]
-    assert reply["charged"] is False
-    assert desk.bodies == []
+@pytest.mark.parametrize("brief", [object(), {"a", "b"}, "x\udcffy"])
+def test_arguments_that_are_not_text_are_refused_before_payment(api, brief):
+    assert hire(brief) == {"error": brainchain.NOT_TEXT, "charged": False}
+    assert api.bodies == []
 
 
-def test_an_unrecorded_payment_is_dropped_only_once_it_expired(desk):
-    desk.status = 404
+def test_an_unrecorded_payment_is_dropped_once_expired(
+    api,
+):
+    api.paid = brainchain.requests.Timeout()
+    api.missing = FakeResponse(*NO_ORDER)
 
     assert hire()["pending"] is True
     assert hire()["order"] == ORDER
-    assert desk.payments == 1
+    assert api.payments == 1
 
-    desk.challenge = payment_required(offer(BASE, valid_seconds=-1))
+    api.challenge = payment_required(offer(BASE, valid_seconds=-1))
     reply = hire("List the primes below 20.")
     hire("List the primes below 20.")
 
     assert reply["charged"] is False
-    assert desk.payments == 3
+    assert api.payments == 3
 
 
-def test_a_redirected_result_is_not_read(desk):
-    desk.views = [ACCEPTED]
-    desk.result = FakeResponse(
+@pytest.mark.parametrize(
+    ("paid", "missing"),
+    [
+        (FakeResponse(202, {"order": ORDER}), NO_ORDER),
+        (brainchain.requests.Timeout(), HOST_404),
+    ],
+)
+def test_a_bare_404_keeps_the_order(api, paid, missing):
+    api.challenge = payment_required(offer(BASE, valid_seconds=-1))
+    api.paid = paid
+    api.missing = FakeResponse(*missing)
+
+    reply = hire()
+
+    assert reply["pending"] is True
+    assert "charged" not in reply
+    assert hire()["order"] == ORDER
+    assert api.payments == 1
+
+
+def test_only_the_exact_offer_is_priced_and_paid(api):
+    bull = {**offer(BASE, amount="5000000"), "scheme": "bull-agreement"}
+    api.challenge = payment_required(bull, offer(BASE))
+
+    assert hire()["pending"] is True
+    assert api.payments == 1
+
+
+def test_a_redirected_result_is_not_read(api):
+    api.views = [ACCEPTED]
+    api.result = FakeResponse(
         302, headers={"Location": "https://worker.example/out.txt"}
     )
 
@@ -412,18 +455,18 @@ def test_a_redirected_result_is_not_read(desk):
 
 
 @pytest.mark.parametrize("empty", ["", "   "])
-def test_empty_settings_use_defaults_and_briefs_post_as_utf8(desk, monkeypatch, empty):
-    desk.views = [ACCEPTED]
+def test_empty_settings_use_defaults_and_briefs_post_as_utf8(api, monkeypatch, empty):
+    api.views = [ACCEPTED]
     for name in ("PAY_ON", "MAX_PRICE_UNITS", "WAIT_SECONDS"):
         monkeypatch.setenv(f"BRAINCHAIN_{name}", empty)
 
     reply = hire("Résumé of 東京, in one line.")
 
     assert reply["accepted"] is True
-    assert "東京".encode() in desk.bodies[0]
+    assert "東京".encode() in api.bodies[0]
 
 
-def test_a_poll_error_keeps_the_paid_order(desk, monkeypatch):
+def test_a_poll_error_keeps_the_paid_order(api, monkeypatch):
     def broken(url, timeout=None, allow_redirects=None):
         raise RuntimeError("boom")
 
@@ -431,16 +474,16 @@ def test_a_poll_error_keeps_the_paid_order(desk, monkeypatch):
 
     reply = hire()
 
+    assert reply["pending"] is True
     assert reply["error"] == "boom"
     assert reply["order"] == ORDER
     assert reply["status_url"] == f"{URL}/x402/tasks/{ORDER}"
     assert reply.get("charged") is not False
     assert hire()["order"] == ORDER
-    assert desk.payments == 1
+    assert api.payments == 1
 
 
 def test_the_order_id_matches_the_one_brainchain_computes():
-    pytest.importorskip("eth_utils")
     payload = {
         "signature": "0x" + "ab" * 65,
         "authorization": {
@@ -454,21 +497,21 @@ def test_the_order_id_matches_the_one_brainchain_computes():
         "note": "café ✓",
     }
 
-    # Computed with the desk's own orderId for this payload.
+    # Computed with the api's own orderId for this payload.
     assert brainchain._order_id(payload) == (
         "0xd17f9c7166da3ed2b502523d75d524b581a38b38215ebdb2b0a8bf4ace074605"
     )
 
 
-def test_robinhood_payments_sign_without_an_approval(desk, monkeypatch):
+def test_robinhood_payments_sign_without_an_approval(api, monkeypatch):
     monkeypatch.setenv("BRAINCHAIN_PAY_ON", "robinhood")
-    desk.challenge = payment_required(
+    api.challenge = payment_required(
         offer(ROBINHOOD, assetTransferMethod="permit2"),
         offer(ROBINHOOD, name="Global Dollar", version="1"),
     )
     config = brainchain._config()
 
-    headers, order, payer = SIGN_PAYMENT(desk.challenge, config)
+    headers, order, payer = SIGN_PAYMENT(api.challenge, config)
     signed = json.loads(base64.b64decode(next(iter(headers.values()))))
 
     assert "authorization" in signed["payload"]
@@ -480,7 +523,7 @@ def test_robinhood_payments_sign_without_an_approval(desk, monkeypatch):
 
 
 @pytest.mark.parametrize("payer_key", ["0" * 64, "f" * 64])
-def test_invalid_wallet_keys_are_refused(desk, monkeypatch, payer_key):
+def test_invalid_wallet_keys_are_refused(api, monkeypatch, payer_key):
     monkeypatch.setenv("BRAINCHAIN_PAYER_KEY", payer_key)
     monkeypatch.setattr(brainchain, "_sign_payment", SIGN_PAYMENT)
 
@@ -488,4 +531,4 @@ def test_invalid_wallet_keys_are_refused(desk, monkeypatch, payer_key):
         "error": "BRAINCHAIN_PAYER_KEY is not a valid wallet private key.",
         "charged": False,
     }
-    assert desk.payments == 0
+    assert api.payments == 0

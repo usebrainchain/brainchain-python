@@ -8,6 +8,7 @@ from typing import Any
 
 import requests
 from eth_account import Account
+from eth_utils.crypto import keccak
 from x402 import x402ClientSync
 from x402.http import x402HTTPClientSync
 from x402.mechanisms.evm.exact.register import register_exact_evm_client
@@ -40,15 +41,17 @@ POLL_SECONDS = 10
 # How long a signed payment is valid when the offer names no limit.
 PAYMENT_VALID_SECONDS = 300
 
+NOT_TEXT = "title and brief must be text and levels a list of text, in valid UTF-8."
+
 REFUND_NOTES = {
     "refunding": "The payment is being refunded to the paying wallet.",
-    "refunded": "The full payment went back to the paying wallet.",
+    "refunded": "The payment was refunded to the paying wallet.",
     "refund-failed": "The refund failed: write to "
     "hello@usebrainchain.com with the order id.",
 }
 
-_orders: dict[str, dict[str, Any]] = {}
-_task_locks: dict[str, threading.Lock] = {}
+_orders: dict[tuple[str, bytes], dict[str, Any]] = {}
+_task_locks: dict[tuple[str, bytes], threading.Lock] = {}
 _registry_lock = threading.Lock()
 
 
@@ -59,7 +62,7 @@ def hire_on_brainchain(
 ) -> str:
     """Hire a model on BrainChain for a task and return the accepted result.
 
-    Work that is not accepted is refunded to the paying wallet. Each
+    If the work is not accepted, the payment is refunded. Each
     task costs 1 USDC on Base or 1 USDG on Robinhood Chain. Briefs
     and accepted results are public, so never put secrets or private
     data in a brief.
@@ -67,8 +70,8 @@ def hire_on_brainchain(
     Args:
         title: One line naming the deliverable, up to 120 characters.
         brief: What to produce, with every fact the model needs, up to
-            32,000 characters and 64,000 bytes. The hired model cannot
-            browse.
+            32,000 characters. The whole task must fit in 64,000 bytes
+            as JSON. The hired model cannot browse.
         levels: Two or three quality levels, best first, each up to 200
             characters. With three, the work is accepted at the second
             level or better; with two, only at the first. Defaults to
@@ -77,11 +80,13 @@ def hire_on_brainchain(
     Returns:
         A JSON string. When the work is accepted it holds accepted true
         and the result, or result_url when the text could not be read.
-        When it is not, accepted false and the reason. When the task is
-        still running, pending true: call again with the same arguments
-        to keep waiting. A paid order is kept in this process, so an
-        identical call never pays again. A refusal before payment holds
-        error and charged false.
+        When it is not, accepted false and the reason. When the outcome
+        is not known yet, pending true: call again with the same
+        arguments to keep waiting. A paid order is kept in this process,
+        so an identical call never pays again. A refusal before payment
+        holds error and charged false; an error without charged means the
+        wallet may have been charged, so call again with the same
+        arguments.
     """
     try:
         config = _config()
@@ -94,12 +99,12 @@ def hire_on_brainchain(
     try:
         return json.dumps(_hire(config, title, brief, levels))
     except Exception as error:
-        # A raise makes the agent retry; a reply never pays twice.
+        # The agent can act on a returned error; a raise may end its run.
         return json.dumps(
             {
                 "error": str(error),
-                "message": "Calling again with the same arguments "
-                "in this process does not pay twice.",
+                "message": "The wallet may have been charged. Call again "
+                "with the same arguments in this process: that never pays twice.",
             }
         )
 
@@ -107,11 +112,14 @@ def hire_on_brainchain(
 def _hire(
     config: dict[str, Any], title: str, brief: str, levels: list[str]
 ) -> dict[str, Any]:
-    body = {"title": title, "brief": brief, "levels": levels}
+    task = {"title": title, "brief": brief, "levels": levels}
     try:
-        key = json.dumps([config["network"], body], sort_keys=True)
-    except (TypeError, ValueError) as error:
-        return {"error": str(error), "charged": False}
+        # Raw UTF-8 keeps a non-English brief inside the byte limit.
+        body = json.dumps(task, ensure_ascii=False).encode()
+    except (TypeError, ValueError):
+        return {"error": NOT_TEXT, "charged": False}
+
+    key = (config["network"], body)
 
     with _registry_lock:
         task_lock = _task_locks.setdefault(key, threading.Lock())
@@ -128,6 +136,7 @@ def _hire(
         outcome = _wait_for_outcome(posted, config["wait_seconds"])
     except Exception as error:
         return {
+            "pending": True,
             "error": str(error),
             "order": posted["order"],
             "status_url": f"{BRAINCHAIN_URL}/x402/tasks/{posted['order']}",
@@ -145,7 +154,6 @@ def _hire(
 
 
 def _config() -> dict[str, Any]:
-    """Read and check the BRAINCHAIN_* settings."""
     pay_on = _setting("BRAINCHAIN_PAY_ON", "base").lower()
     payer_key = _setting("BRAINCHAIN_PAYER_KEY", "")
     max_price = _setting("BRAINCHAIN_MAX_PRICE_UNITS", "1000000")
@@ -153,9 +161,11 @@ def _config() -> dict[str, Any]:
 
     if pay_on not in BRAINCHAIN_PAYMENTS:
         raise ValueError("BRAINCHAIN_PAY_ON must be base or robinhood.")
+    if not payer_key:
+        raise ValueError("Set BRAINCHAIN_PAYER_KEY to the paying wallet's private key.")
     if not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", payer_key):
         raise ValueError(
-            "Set BRAINCHAIN_PAYER_KEY to the paying wallet's 32-byte hex private key."
+            "BRAINCHAIN_PAYER_KEY must be a 32-byte hex private key, with or without 0x."
         )
     if not max_price.isdigit() or int(max_price) <= 0:
         raise ValueError(
@@ -163,7 +173,9 @@ def _config() -> dict[str, Any]:
             "number of base units, such as 1000000 for 1 USDC."
         )
     if not wait_seconds.isdigit():
-        raise ValueError("BRAINCHAIN_WAIT_SECONDS must be a whole number of seconds.")
+        raise ValueError(
+            "BRAINCHAIN_WAIT_SECONDS must be a whole number of seconds, 0 or more."
+        )
 
     network, asset, token = BRAINCHAIN_PAYMENTS[pay_on]
 
@@ -178,11 +190,11 @@ def _config() -> dict[str, Any]:
 
 
 def _setting(name: str, default: str) -> str:
-    """Read one setting; an empty value counts as unset."""
+    """Blank values count as unset."""
     return (os.getenv(name) or "").strip() or default
 
 
-def _post_task(config: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+def _post_task(config: dict[str, Any], body: bytes) -> dict[str, Any]:
     url = f"{BRAINCHAIN_URL}/x402/tasks"
 
     try:
@@ -190,7 +202,7 @@ def _post_task(config: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     except requests.RequestException as error:
         return {
             "error": "Could not reach BrainChain "
-            f"({type(error).__name__}), so nothing was paid.",
+            f"({type(error).__name__}), so nothing was charged.",
             "charged": False,
         }
 
@@ -205,9 +217,10 @@ def _post_task(config: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         return {"error": str(error), "charged": False}
 
     valid_seconds = offer.get("maxTimeoutSeconds", PAYMENT_VALID_SECONDS)
-    posted = {
+    posted: dict[str, Any] = {
         "order": order,
         "expires_at": time.monotonic() + int(valid_seconds),
+        "settled": False,
     }
 
     try:
@@ -217,28 +230,27 @@ def _post_task(config: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
 
     # 400 and 402 come before the payment is settled.
     if response.status_code in (400, 402):
-        error = _error_text(response)
-        if any(code in error for code in UNFUNDED):
+        refusal = _error_text(response)
+        if any(code in refusal for code in UNFUNDED):
             price = int(offer["amount"]) / 10**6
-            error = (
+            refusal = (
                 f"The paying wallet {payer} holds less than the "
                 f"{price:g} {config['token']} this task costs."
             )
-        return {"error": error, "charged": False}
+        return {"error": refusal, "charged": False}
+
+    # BrainChain answers 202 only once the payment has settled.
+    posted["settled"] = response.status_code == 202
 
     return posted
 
 
 def _post(
-    url: str,
-    body: dict[str, Any],
-    headers: dict[str, str],
-    timeout: int,
+    url: str, body: bytes, headers: dict[str, str], timeout: int
 ) -> requests.Response:
-    """Post JSON as UTF-8, so a non-English brief keeps its size."""
     return requests.post(
         url,
-        data=json.dumps(body, ensure_ascii=False).encode(),
+        data=body,
         headers={"content-type": "application/json", **headers},
         timeout=timeout,
         allow_redirects=False,
@@ -281,8 +293,6 @@ def _sign_payment(
 
 def _order_id(payload: dict[str, Any]) -> str:
     """Name an order as BrainChain does: the hash of the signed payment."""
-    from eth_utils import keccak
-
     canonical = json.dumps(
         payload,
         sort_keys=True,
@@ -300,7 +310,8 @@ def _offer(challenge: requests.Response, config: dict[str, Any]) -> dict[str, An
         offers = [
             offer
             for offer in required["accepts"]
-            if offer["network"] == config["network"]
+            if offer["scheme"] == "exact"
+            and offer["network"] == config["network"]
             and offer["asset"].lower() == config["asset"].lower()
             and int(offer["amount"]) > 0
         ]
@@ -310,7 +321,7 @@ def _offer(challenge: requests.Response, config: dict[str, Any]) -> dict[str, An
     if not offers:
         raise ValueError(f"BrainChain does not take {config['token']} for tasks.")
 
-    offer = _pick(offers)
+    offer: dict[str, Any] = _pick(offers)
 
     if int(offer["amount"]) > config["max_price"]:
         raise ValueError(
@@ -343,13 +354,14 @@ def _wait_for_outcome(posted: dict[str, Any], wait_seconds: int) -> dict[str, An
 
     while True:
         status, view = _read_order(status_url)
-        outcome = _outcome(view) if view else None
+        outcome = _outcome(view) if status == 200 and view else None
 
         if outcome:
             return {**outcome, **reference}
 
-        # An order is recorded before it is settled.
-        if status == 404 and time.monotonic() > posted["expires_at"]:
+        # BrainChain saves an order before settling it; a host's own 404 proves nothing.
+        unrecorded = status == 404 and "error" in view and not posted["settled"]
+        if unrecorded and time.monotonic() > posted["expires_at"]:
             return {
                 "accepted": False,
                 "charged": False,
@@ -362,7 +374,7 @@ def _wait_for_outcome(posted: dict[str, Any], wait_seconds: int) -> dict[str, An
         if remaining <= 0:
             waiting_on = (
                 "BrainChain is still working on the task."
-                if view
+                if status == 200 and view
                 else "BrainChain has not confirmed the payment yet."
             )
             return {
@@ -394,7 +406,7 @@ def _outcome(view: dict[str, Any]) -> dict[str, Any] | None:
 
     if state in REFUND_NOTES or task.get("status") == "refunded":
         reason = view.get("refundReason") or "The work was not accepted."
-        note = REFUND_NOTES.get(state, REFUND_NOTES["refunding"])
+        note = REFUND_NOTES.get(str(state), REFUND_NOTES["refunding"])
         return {"accepted": False, "reason": f"{reason} {note}"}
 
     if task.get("accepted") is False:
@@ -429,10 +441,7 @@ def _read_order(url: str) -> tuple[int, dict[str, Any]]:
     except requests.RequestException:
         return 0, {}
 
-    if response.status_code != 200:
-        return response.status_code, {}
-
-    return 200, _json_body(response)
+    return response.status_code, _json_body(response)
 
 
 def _error_text(response: requests.Response) -> str:
