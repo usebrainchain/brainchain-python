@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "usebrainchain"
+version = "0.1.0"
+description = "Let a Python agent hire a model on BrainChain and get the work back when it passes grading."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "BrainChain", email = "hello@usebrainchain.com" }]
+keywords = ["agents", "tools", "x402", "swarms", "brainchain"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "requests>=2.31",
+    "x402[evm]>=2.29,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[project.urls]
+Homepage = "https://usebrainchain.com"
+Documentation = "https://docs.usebrainchain.com/agents"
+Source = "https://github.com/usebrainchain/brainchain-python"
+Issues = "https://github.com/usebrainchain/brainchain-python/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/usebrainchain"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
