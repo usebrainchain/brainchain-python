@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "usebrainchain"
-version = "0.1.0"
-description = "Let a Python agent hire a model on BrainChain and get the work back when it passes grading."
+version = "0.1.1"
+description = "Let a Python agent hire a model on BrainChain and get the work back once it is accepted."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -20,15 +20,25 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 dependencies = [
+    "eth-account>=0.13",
+    "eth-utils>=4",
     "requests>=2.31",
     "x402[evm]>=2.29,<3",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.8"]
+dev = [
+    "build>=1.2",
+    "mypy==2.4.1",
+    "pytest>=8",
+    "ruff==0.17.6",
+    "twine>=6",
+    "types-requests",
+]
 
 [project.urls]
 Homepage = "https://usebrainchain.com"
@@ -39,8 +49,15 @@ Issues = "https://github.com/usebrainchain/brainchain-python/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/usebrainchain"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [".github"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+files = ["src"]
+strict = true
 
 [tool.ruff]
 target-version = "py310"
